@@ -1,0 +1,68 @@
+{
+  "_comment": "yomiyasu_lint.py --profile で使う用途プロファイル。書き方の説明は references/profiles/*.md、各項目の意味は yomiyasu_lint.py の BASE_PROFILE にある。書いていない項目は default（従来の検査）の値を引き継ぐ。",
+  "proposal": {
+    "description": "提案資料（スライド、企画書、提案書）",
+    "emoji_max": 0,
+    "trailing_colon": "info",
+    "list_ratio_warn": null,
+    "bold_per_1000_warn": 3.0,
+    "sentence_length": {"mean": null, "max": 70, "sd_min": null},
+    "list_item_max": 50,
+    "title_max": 40,
+    "bullet_endings": true,
+    "stiffness_level": 1,
+    "humanize_slop": {},
+    "placeholder_max": 0
+  },
+  "article": {
+    "description": "Web記事（技術ブログ、オウンドメディア、note、社内ブログ）",
+    "emoji_max": 0,
+    "trailing_colon": "warn",
+    "list_ratio_warn": 0.25,
+    "bold_per_1000_warn": 3.0,
+    "sentence_length": {"mean": [22, 50], "max": 90, "sd_min": 7},
+    "short_burst": true,
+    "stiffness_level": 2,
+    "humanize_slop": {"exclaim": 1, "jitsuha": 1, "nandesuyone": 1},
+    "subject_repetition": true,
+    "placeholder_max": 2
+  },
+  "sns": {
+    "description": "SNS投稿（X、Threads、LinkedIn）",
+    "emoji_max": 2,
+    "trailing_colon": "info",
+    "list_ratio_warn": null,
+    "bold_per_1000_warn": null,
+    "sentence_length": {"mean": [8, 35], "max": 60, "sd_min": null},
+    "stiffness_level": 3,
+    "humanize_slop": {"exclaim": 1, "jitsuha": 1, "nandesuyone": 1},
+    "subject_repetition": true,
+    "markdown_unrendered": "warn",
+    "x_weighted_max": 280,
+    "hashtag_max": 2,
+    "placeholder_max": 2
+  },
+  "chat": {
+    "description": "ビジネスチャット（Slack、Teams、Chatworkの社内向け）",
+    "emoji_max": 1,
+    "emoji_allowed": ["🙏", "🙇", "👀", "👍", "🙌", "🎉"],
+    "trailing_colon": "info",
+    "list_ratio_warn": null,
+    "bold_per_1000_warn": null,
+    "sentence_length": {"mean": [12, 40], "max": 70, "sd_min": null},
+    "short_burst": true,
+    "stiffness_level": 3,
+    "humanize_slop": {"exclaim": 1, "jitsuha": 1},
+    "subject_repetition": true,
+    "markdown_unrendered": "info",
+    "placeholder_max": 1
+  },
+  "chat_external": {
+    "extends": "chat",
+    "description": "ビジネスチャット（取引先など社外向け）",
+    "emoji_max": 0,
+    "emoji_allowed": null,
+    "stiffness_level": 2,
+    "humanize_slop": {}
+  }
+}

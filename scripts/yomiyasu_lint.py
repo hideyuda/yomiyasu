@@ -6,12 +6,69 @@ Qiita 7万件の計量調査、統語構造復元論、AI語彙の出現頻度�
 決定論的リンター。標準ライブラリのみで動作。
 """
 
+import os
 import sys
 import re
 import argparse
 import json
+import math
 import unicodedata
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional, Union
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_PROFILES_PATH = os.path.join(SCRIPT_DIR, "profiles.json")
+
+# プロファイルなし（default）の検査項目。従来のyomiyasuと同じ検査になる値にしてある。
+# 用途プロファイル（scripts/profiles.json）は、この値を上書きする形で書く。
+BASE_PROFILE: Dict[str, Any] = {
+    "description": "プロファイルなし（従来のyomiyasuと同じ検査）",
+    "emoji_max": 0,                 # 1文書で使ってよい絵文字の数
+    "emoji_allowed": None,          # 使ってよい絵文字の一覧（None なら種類は問わない）
+    "trailing_colon": "warn",       # 文末コロン: warn / info / off
+    "list_ratio_warn": 0.25,        # 箇条書き比率の警告ライン（None で検査しない）
+    "bold_per_1000_warn": 3.0,      # 太字頻度の警告ライン（None で検査しない）
+    "sentence_end_repetition": True,
+    # 以下は用途プロファイルで使う検査。default では行わない
+    "sentence_length": None,        # {"mean": [下限, 上限] | None, "max": 字数 | None, "sd_min": 値 | None}
+    "short_burst": False,           # 10字未満の文が3つ続くところを検出する
+    "list_item_max": None,          # 箇条書き1項目の字数の上限
+    "title_max": None,              # タイトル（# 見出し）の字数の上限
+    "bullet_endings": False,        # 箇条書きの語尾（です・ます / 体言止め / 動詞止め）のそろい方を検査する
+    "stiffness_level": 0,           # 硬さ辞書を使う強さ（0〜3）
+    "humanize_slop": None,          # 人間らしさスロップの上限 {パターンID: 回数}。None で検査しない
+    "subject_repetition": False,    # 同じ主語のくり返しを検出する
+    "markdown_unrendered": "off",   # 表示されないMarkdown（**、見出し、表）: warn / info / off
+    "x_weighted_max": None,         # Xの文字数上限（全角2・半角1で数える。280で全角140字）
+    "hashtag_max": None,            # ハッシュタグの上限
+    "placeholder_max": None,        # 書き手に埋めてもらう空欄「[ここに…]」の上限
+}
+
+
+def load_profiles(extra_path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """同梱の profiles.json と、追加の設定ファイル（任意）からプロファイルを読み込む。
+    "extends" で別のプロファイルを引き継げる。"_" で始まるキーは注記として読み飛ばす。"""
+    profiles: Dict[str, Dict[str, Any]] = {"default": dict(BASE_PROFILE)}
+    paths = [DEFAULT_PROFILES_PATH]
+    if extra_path:
+        if not os.path.exists(extra_path):
+            raise FileNotFoundError(extra_path)
+        paths.append(extra_path)
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for name, conf in data.items():
+            if name.startswith("_"):
+                continue
+            parent = conf.get("extends", "default")
+            if parent not in profiles:
+                raise ValueError(f"プロファイル「{name}」の extends「{parent}」が見つかりません（先に定義してください）")
+            merged = dict(profiles[parent])
+            merged.update({k: v for k, v in conf.items() if k != "extends"})
+            profiles[name] = merged
+    return profiles
 
 
 # 絵文字正規表現パターン（CJK統合漢字拡張などのサロゲートペア漢字を除外した厳密な絵文字範囲）
@@ -78,6 +135,72 @@ FILLER_PATTERNS = [
 # ネガティブパラレリズム（AではなくB）
 NEGATIVE_PARALLELISM_PATTERN = re.compile(r"([^。、]+)ではなく、?([^。、]+)")
 
+# 硬さ辞書（references/humanize/stiffness.md）
+# (開く強さ, 正規表現, 見つけた言い方, ふだんの言い方の例)。プロファイルの stiffness_level 以下の強さのものを検査する
+STIFFNESS_PATTERNS = [
+    (1, r"ことが可能", "〜することが可能です", "〜できます"),
+    (1, r"(確認|作業|対応|調査|検証|設定|説明|連絡|共有|報告|議論|修正|変更|登録|分析|検討)を(行|おこな)[いうっわえ]",
+     "〜を行う", "〜する（「確認を行う」→「確認する」）"),
+    (1, r"という形(になります|になる|です|で進め)", "〜という形になります", "〜します / 〜です"),
+    (1, r"ということになります", "〜ということになります", "〜です"),
+    (1, r"次第(です|でございます)", "〜の次第です", "〜です"),
+    (1, r"でございます", "〜でございます", "〜です"),
+    (2, r"において", "〜において", "〜で"),
+    (2, r"に関して|に関しまして", "〜に関して", "〜について"),
+    (2, r"を要(する|します|しました|した|し、)", "〜を要する", "〜がかかる / 〜が要る"),
+    (2, r"発生(する|します|した|しました|し|いたし)", "発生する", "起きる / 出る"),
+    (2, r"迅速[にな]", "迅速に", "すぐに / 早めに"),
+    (2, r"円滑[にな]", "円滑に", "スムーズに / 問題なく"),
+    (2, r"担保", "担保する", "守る / 確保する / 保証する"),
+    (2, r"に資する|に寄与", "〜に資する / 〜に寄与する", "〜に役立つ"),
+    (2, r"の観点から", "〜の観点から", "〜から見ると / 〜を考えると"),
+    (2, r"を活用", "〜を活用する", "〜を使う"),
+    (2, r"を推進", "〜を推進する", "〜を進める"),
+    (2, r"不可欠", "不可欠です", "欠かせません / 必要です"),
+    (2, r"を図(る|り|ります|って)", "〜を図る", "〜する"),
+    (2, r"が可能(です|となります|になります|だ|である)", "〜が可能です", "〜できます"),
+    (2, r"となります", "〜となります", "〜です（変化を表す「〜となる」は残す）"),
+    (3, r"したがって|すなわち|ならびに", "したがって / すなわち / ならびに", "なので / つまり / と"),
+    (3, r"と考えております|と存じます", "〜と考えております", "〜と思っています"),
+    (3, r"のほど、?(よろしく)?お願い(いたし|申し上げ)", "〜のほどよろしくお願いいたします", "〜をお願いします"),
+]
+
+# 1文書に何度も出ると硬くなる言い方（2回目から検出）。(開く強さ, 正規表現, 見つけた言い方, ふだんの言い方の例)
+STIFFNESS_REPEAT_PATTERNS = [
+    (1, r"させていただ[きくけい]", "〜させていただきます", "〜します（相手の許可をもらう場面だけ残す）"),
+    (1, r"いただけますと幸いです|いただければ幸いです", "〜いただけますと幸いです", "〜をお願いします / 〜してください"),
+]
+
+# 人間らしさスロップ（references/humanize/humanize-slop.md）。(ID, 正規表現, 説明)
+# プロファイルの humanize_slop に上限を書く。書いていないIDの上限は0回
+HUMANIZE_SLOP_PATTERNS = [
+    ("shoujiki", r"正直(に言うと|に言えば|なところ|、)", "「正直、」の前置き"),
+    ("bucchake", r"ぶっちゃけ|マジで|ガチで", "演出としての口語（ぶっちゃけ、マジで、ガチで）"),
+    ("nandesuyone", r"んですよね", "「〜なんですよね」"),
+    ("janaidesuka", r"じゃないですか", "「〜じゃないですか」"),
+    ("ttekanji", r"って感じ(です|でした|。|$)|的な(感じ|。|$)", "「〜って感じ」「〜的な」のぼかし"),
+    ("exclaim", r"！|!(?![\[=])", "感嘆符「！」"),
+    ("warai", r"（笑）|\(笑\)|(?<![一-龥ぁ-ん])笑(?=[。\s]|$)|ｗ{2,}|(?<![A-Za-z])w{3,}(?![A-Za-z.])", "「笑」「w」"),
+    ("jitsuha", r"実は|意外と|ちなみに|ここだけの話", "「実は」「意外と」「ちなみに」"),
+    ("rhetorical", r"ではないでしょうか", "修辞疑問「〜ではないでしょうか」"),
+    ("ad_question", r"(で|に)(困って|悩んで)(い)?ませんか", "広告の問いかけ「〜で困っていませんか」"),
+    ("greeting", r"(みなさん|皆さん|皆様)、?こんにちは", "定型の挨拶「みなさん、こんにちは」"),
+    ("ikimashou", r"いきましょう[！!]", "定型の呼びかけ「〜していきましょう！」"),
+    ("sns_bracket", r"【(保存版|必見|朗報|永久保存版?|悲報|拡散希望)】", "煽りの見出し【保存版】【必見】"),
+    ("sns_title", r"(な件|してみた)[。！!]?$", "定型タイトル「〜な件」「〜してみた」"),
+    ("thread_point", r"👇|🧵|スレッドで(解説|まとめ)", "スレッド誘導「👇」「スレッドで解説」"),
+    ("fabricated", r"(先日|この前|以前)、?(私|僕|自分|筆者)も", "体験談の書き出し（元の文にある体験か確かめる）"),
+]
+
+# 書き手に埋めてもらう空欄
+PLACEHOLDER_PATTERN = re.compile(r"\[ここに[^\]]*\]")
+
+# 文頭の主語（「インフラチームは」「私は」）
+SUBJECT_HEAD_PATTERN = re.compile(r"^([一-龥々ァ-ヶーA-Za-z0-9＆&・]{1,15}?)(では|は|が)、?")
+
+# ハッシュタグ（行頭の「# 見出し」は除く）
+HASHTAG_PATTERN = re.compile(r"(?<![\w#＃&])[#＃](?![#＃\s])[^\s#＃、。]+")
+
 
 def get_frontmatter_line_count(lines: List[str]) -> int:
     """YAMLフロントマター（先頭の --- から 次の --- まで）の行数を返す"""
@@ -89,8 +212,9 @@ def get_frontmatter_line_count(lines: List[str]) -> int:
     return 0
 
 
-def extract_plain_sentences(text: str) -> List[Tuple[int, str]]:
-    """コードブロックや引用、箇条書きを除去し、地の文の段落文（行番号つき）を抽出する"""
+def extract_plain_sentences(text: str, min_len: int = 4, dot_bullets: bool = False) -> List[Tuple[int, str]]:
+    """コードブロックや引用、箇条書きを除去し、地の文の段落文（行番号つき）を抽出する（min_len 字未満の断片は除く）。
+    dot_bullets=True のときは「・」で始まる行も箇条書きとして除く（用途プロファイルで使う）"""
     lines = text.split("\n")
     sentences = []
     in_code_block = False
@@ -115,6 +239,7 @@ def extract_plain_sentences(text: str) -> List[Tuple[int, str]]:
             or stripped.startswith("<")
             or stripped.startswith(">")
             or re.match(r"^[-*+]\s|^\d+\.\s", stripped)
+            or (dot_bullets and stripped.startswith("・"))
             or line.startswith("  ")
             or line.startswith("\t")
         ):
@@ -124,7 +249,7 @@ def extract_plain_sentences(text: str) -> List[Tuple[int, str]]:
         raw_sents = re.split(r"(?<=[。！？])", stripped)
         for s in raw_sents:
             s_clean = s.strip()
-            if s_clean and len(s_clean) > 3:
+            if s_clean and len(s_clean) >= min_len:
                 sentences.append((idx, s_clean))
 
     return sentences
@@ -176,7 +301,7 @@ def check_sentence_end_repetitions(sentences: List[Tuple[int, str]]) -> List[Dic
     return findings
 
 
-def analyze_markdown_metrics(text: str) -> Dict[str, Any]:
+def analyze_markdown_metrics(text: str, dot_bullets: bool = False) -> Dict[str, Any]:
     """太字頻度、箇条書き比率などの構造メトリクスを算出（引用文やコードブロックは除外）"""
     lines = text.split("\n")
     plain_lines = []
@@ -196,7 +321,7 @@ def analyze_markdown_metrics(text: str) -> Dict[str, Any]:
     total_lines = len([l for l in plain_lines if l.strip()])
     list_lines = 0
     for l in plain_lines:
-        if re.match(r"^\s*([-*+]|\d+\.)\s+", l):
+        if re.match(r"^\s*([-*+]|\d+\.)\s+", l) or (dot_bullets and l.strip().startswith("・")):
             # 外部参照リンク（- [タイトル](http...)）は並列データのため思考リストから除外
             if not re.search(r"[-*+]\s+\[.*?\]\(https?://", l):
                 list_lines += 1
@@ -351,34 +476,378 @@ def _bold_short(s: str) -> str:
     return s if len(s) <= 30 else s[:12] + "…" + s[-12:]
 
 
-def lint_text(text: str) -> Dict[str, Any]:
-    """文章全体を総合検査する"""
+# ---- 用途プロファイルの検査 ----
+
+def _content_lines(text: str):
+    """コードブロックと先頭の設定部分を除いた (行番号, 行) を順に返す"""
+    lines = text.split("\n")
+    fm_lines = get_frontmatter_line_count(lines)
+    in_code = False
+    for line_no, line in enumerate(lines, 1):
+        if line_no <= fm_lines:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        yield line_no, line
+
+
+def _is_example_line(stripped: str) -> bool:
+    """引用・表・画像・HTMLの行（悪い例の引用などが多いため語彙の検査から外す）"""
+    return (stripped.startswith(">") or stripped.startswith("|") or stripped.startswith("![")
+            or stripped.startswith("[![") or stripped.startswith("<"))
+
+
+def _scan_text(line: str) -> str:
+    """インラインコード、URL、見出し記号、太字記号を除いた検査用の文字列"""
+    s = re.sub(r"`[^`]+`", "", line.strip())
+    s = re.sub(r"https?://\S+", "", s)
+    s = re.sub(r"^#{1,6}\s+", "", s)
+    return re.sub(r"\*\*|__", "", s)
+
+
+def _sentence_len(s: str) -> int:
+    """文の字数（空白、句点、感嘆符、Markdownの記号を除く）"""
+    return len(re.sub(r"[\s。！？!?]", "", re.sub(r"\*\*|`", "", s)))
+
+
+LIST_ITEM_PATTERN = re.compile(r"^(\s*)([-*+]\s+|\d+\.\s+|・)(.*)$")
+
+
+def _ending_kind(item: str) -> str:
+    """箇条書き1項目の語尾の種類: polite（です・ます）/ verb（動詞・形容詞止め）/ noun（体言止め）"""
+    s = re.sub(r"[\s。、．.！？!?）)」』]+$", "", re.sub(r"\*\*|`", "", item))
+    if re.search(r"(です|ます|ました|でした|ません|ください)$", s):
+        return "polite"
+    if re.search(r"([うくぐすつぬぶむるたいだ]|ない)$", s):
+        return "verb"
+    return "noun"
+
+
+def x_weighted_length(text: str) -> int:
+    """Xの文字数の数え方（全角2・半角1、URLは23）で数える"""
+    text = re.sub(r"https?://\S+", "x" * 23, text)
+    n = 0
+    for ch in text:
+        o = ord(ch)
+        if o <= 0x10FF or 0x2000 <= o <= 0x200D or 0x2010 <= o <= 0x201F or 0x2032 <= o <= 0x2037:
+            n += 1
+        elif 0xFE00 <= o <= 0xFE0F or o == 0x200D:
+            continue
+        else:
+            n += 2
+    return n
+
+
+def _x_segments(text: str) -> List[Tuple[int, str]]:
+    """「---」だけの行で区切った投稿ごとの (開始行, 本文)"""
+    segments, start, buf = [], 1, []
+    for idx, line in enumerate(text.split("\n") + ["---"], 1):
+        if line.strip() == "---":
+            segments.append((start, "\n".join(buf).strip()))
+            start, buf = idx + 1, []
+        else:
+            buf.append(line)
+    return [seg for seg in segments if seg[1]]
+
+
+def _list_items(text: str) -> List[Tuple[int, int, str]]:
+    """箇条書きの (行番号, 字下げ, 本文)。「・」で始まる行も含む"""
+    items = []
+    for line_no, line in _content_lines(text):
+        m = LIST_ITEM_PATTERN.match(line)
+        if m:
+            items.append((line_no, len(m.group(1).replace("\t", "    ")), m.group(3).strip()))
+    return items
+
+
+def register_metrics(text: str, sentences: List[Tuple[int, str]]) -> Dict[str, Any]:
+    """文の長さの平均・ばらつき・最大、漢字の割合（ひらがな・カタカナ・漢字に占める漢字）、箇条書き、見出し、Xの文字数"""
+    lengths = [_sentence_len(s) for _, s in sentences]
+    n = len(lengths)
+    mean = sum(lengths) / n if n else 0.0
+    sd = math.sqrt(sum((x - mean) ** 2 for x in lengths) / n) if n else 0.0
+    jp = kanji = 0
+    for _, line in _content_lines(text):
+        for ch in _scan_text(line):
+            is_kanji = "一" <= ch <= "鿿" or ch == "々"
+            if is_kanji or "぀" <= ch <= "ヿ":
+                jp += 1
+                kanji += is_kanji
+    item_lengths = [_sentence_len(item) for _, _, item in _list_items(text)]
+    headings = [(no, re.sub(r"^#{1,6}\s+", "", line.strip())) for no, line in _content_lines(text)
+                if re.match(r"^\s*#{1,6}\s", line)]
+    return {
+        "sentence_count": n,
+        "sentence_len_mean": round(mean, 1),
+        "sentence_len_sd": round(sd, 1),
+        "sentence_len_max": max(lengths) if lengths else 0,
+        "kanji_ratio": round(kanji / jp, 3) if jp else 0.0,
+        "list_item_count": len(item_lengths),
+        "list_item_len_mean": round(sum(item_lengths) / len(item_lengths), 1) if item_lengths else 0.0,
+        "list_item_len_max": max(item_lengths) if item_lengths else 0,
+        "heading_len_max": max((_sentence_len(h) for _, h in headings), default=0),
+        "x_weighted_lengths": [x_weighted_length(seg) for _, seg in _x_segments(text)],
+    }
+
+
+def _finding(rule: str, line: int, severity: str, message: str, snippet: str) -> Dict[str, Any]:
+    return {"rule": rule, "line": line, "severity": severity, "message": message, "snippet": snippet}
+
+
+def check_profile(text: str, sentences: List[Tuple[int, str]], prof: Dict[str, Any],
+                  reg: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Tuple[int, str]]]:
+    """用途プロファイルで追加される検査。(指摘, 空欄の一覧) を返す"""
+    findings: List[Dict[str, Any]] = []
+
+    # 文の長さ
+    sl = prof.get("sentence_length")
+    if sl and reg["sentence_count"] >= 3:
+        rng = sl.get("mean")
+        if rng and not (rng[0] <= reg["sentence_len_mean"] <= rng[1]):
+            findings.append(_finding(
+                "sentence_length_mean", 1, "info",
+                f"文の平均の長さ（{reg['sentence_len_mean']}字）が、この用途の目安（{rng[0]}〜{rng[1]}字）から外れています。",
+                f"文の数: {reg['sentence_count']}"))
+        sd_min = sl.get("sd_min")
+        if sd_min and reg["sentence_count"] >= 6 and reg["sentence_len_sd"] < sd_min:
+            findings.append(_finding(
+                "sentence_length_flat", 1, "info",
+                f"文の長さがそろいすぎています（ばらつき {reg['sentence_len_sd']}）。同じ長さの文が続くと機械的に読めます。",
+                f"平均 {reg['sentence_len_mean']}字"))
+        mx = sl.get("max")
+        if mx:
+            for line_no, s in [(no, s) for no, s in sentences if _sentence_len(s) > mx][:3]:
+                findings.append(_finding(
+                    "sentence_too_long", line_no, "warn",
+                    f"1文が{_sentence_len(s)}字あります（この用途の上限: {mx}字）。つながりを後ろの文のつなぎ言葉で残せるなら、2文に分けます。",
+                    s))
+
+    # 短い文の連打（AIの劇画調）。「速い。」のような3字の文も数えるため、文を取り直す
+    if prof.get("short_burst"):
+        run: List[Tuple[int, str]] = []
+        for item in extract_plain_sentences(text, min_len=2, dot_bullets=True) + [(0, "x" * 20)]:
+            if _sentence_len(item[1]) < 10:
+                run.append(item)
+                continue
+            if len(run) >= 3:
+                findings.append(_finding(
+                    "short_burst", run[2][0], "warn",
+                    "10字未満の短い文が3つ以上続いています。言い切りを重ねて勢いを出す書き方はAIっぽく見えやすいので、つなげられる文はつなげます。",
+                    " ".join(s for _, s in run[:4])))
+            run = []
+
+    # 同じ主語のくり返し
+    if prof.get("subject_repetition"):
+        recent: List[Optional[str]] = []
+        for line_no, s in sentences:
+            m = SUBJECT_HEAD_PATTERN.match(s)
+            subj = m.group(1) if m else None
+            if subj and subj in recent:
+                findings.append(_finding(
+                    "subject_repetition", line_no, "info",
+                    f"主語「{subj}」が近くの文でくり返されています。誰が動くかが変わらないなら、2回目以降は省いても通じます。",
+                    s))
+            recent = (recent + [subj])[-2:]
+
+    # 箇条書き（1項目の長さと語尾のそろい方）
+    blocks: List[List[Tuple[int, str]]] = []
+    prev_no, prev_indent = -2, None
+    for line_no, indent, item in _list_items(text):
+        if line_no == prev_no + 1 and indent == prev_indent and blocks:
+            blocks[-1].append((line_no, item))
+        else:
+            blocks.append([(line_no, item)])
+        prev_no, prev_indent = line_no, indent
+    if prof.get("list_item_max"):
+        for block in blocks:
+            for line_no, item in block:
+                if _sentence_len(item) > prof["list_item_max"]:
+                    findings.append(_finding(
+                        "list_item_too_long", line_no, "info",
+                        f"箇条書きの1項目が{_sentence_len(item)}字あります（目安: {prof['list_item_max']}字以内）。1項目1行に収まるよう削ります。",
+                        item))
+    if prof.get("bullet_endings"):
+        for block in blocks:
+            kinds = [(_ending_kind(item), line_no, item) for line_no, item in block]
+            polite = [k for k in kinds if k[0] == "polite"]
+            if polite:
+                findings.append(_finding(
+                    "bullet_polite", polite[0][1], "warn",
+                    "資料の箇条書きで「です・ます」が使われています。常体（体言止めか動詞止め）にそろえます。",
+                    polite[0][2]))
+            plain = {k[0] for k in kinds if k[0] != "polite"}
+            if len(block) >= 2 and len(plain) > 1:
+                findings.append(_finding(
+                    "bullet_mixed_endings", block[0][0], "info",
+                    "同じ階層の箇条書きで、体言止めと動詞止めが混ざっています。どちらかにそろえます。",
+                    " / ".join(item for _, item in block[:4])))
+
+    # タイトル（見出し）の字数
+    if prof.get("title_max"):
+        for line_no, line in _content_lines(text):
+            if re.match(r"^\s*#{1,6}\s", line):
+                title = re.sub(r"^\s*#{1,6}\s+", "", line.strip())
+                if _sentence_len(title) > prof["title_max"]:
+                    findings.append(_finding(
+                        "title_too_long", line_no, "info",
+                        f"タイトルが{_sentence_len(title)}字あります（目安: {prof['title_max']}字以内）。スライドで2行に収まるよう、主張だけを残します。",
+                        title))
+
+    # 表示されないMarkdown
+    md_sev = prof.get("markdown_unrendered", "off")
+    if md_sev in ("warn", "info"):
+        for line_no, line in _content_lines(text):
+            s = line.strip()
+            kind = None
+            if re.match(r"^#{1,6}\s", s):
+                kind = "見出し（#）"
+            elif s.startswith("|"):
+                kind = "表（|）"
+            elif "**" in re.sub(r"`[^`]+`", "", s):
+                kind = "太字（**）"
+            if kind:
+                findings.append(_finding(
+                    "markdown_unrendered", line_no, md_sev,
+                    f"この用途ではMarkdownの{kind}が表示されず、記号のまま出ることがあります。",
+                    s))
+
+    # ハッシュタグ
+    if prof.get("hashtag_max") is not None:
+        tags = [(no, t) for no, line in _content_lines(text) if not re.match(r"^\s*#{1,6}\s", line)
+                for t in HASHTAG_PATTERN.findall(re.sub(r"https?://\S+", "", line))]
+        if len(tags) > prof["hashtag_max"]:
+            findings.append(_finding(
+                "too_many_hashtags", tags[0][0], "warn",
+                f"ハッシュタグが{len(tags)}個あります（この用途の上限: {prof['hashtag_max']}個）。",
+                " ".join(t for _, t in tags)))
+
+    # Xの文字数（「---」だけの行で区切った投稿ごと）
+    xmax = prof.get("x_weighted_max")
+    if xmax:
+        for seg_start, seg in _x_segments(text):
+            w = x_weighted_length(seg)
+            if w > xmax:
+                findings.append(_finding(
+                    "x_length", seg_start, "warn",
+                    f"Xの文字数の上限を超えています（全角換算で約{math.ceil(w / 2)}字 / 上限{xmax // 2}字）。削るか、投稿を分けます。LinkedInなど長文を投稿できる場では無視してかまいません。",
+                    seg.split("\n")[0].strip()))
+
+    # 硬さ辞書
+    level = prof.get("stiffness_level", 0) or 0
+    if level:
+        repeat_counts: Dict[str, int] = {}
+        for line_no, line in _content_lines(text):
+            s = line.strip()
+            if not s or _is_example_line(s):
+                continue
+            st = _scan_text(s)
+            for lv, pat, found, plain in STIFFNESS_PATTERNS:
+                if lv <= level and re.search(pat, st):
+                    findings.append(_finding(
+                        "stiff_expression", line_no, "warn" if lv == 1 else "info",
+                        f"硬い言い方「{found}」があります。この用途では「{plain}」のような言い方のほうが読みやすくなります。専門用語や、言い切りの強さが変わる場合は残します。",
+                        s))
+            for lv, pat, found, plain in STIFFNESS_REPEAT_PATTERNS:
+                if lv > level:
+                    continue
+                for _ in re.finditer(pat, st):
+                    repeat_counts[found] = repeat_counts.get(found, 0) + 1
+                    if repeat_counts[found] == 2:
+                        findings.append(_finding(
+                            "stiff_repetition", line_no, "warn",
+                            f"「{found}」が1文書に2回以上出ています。2回目からは「{plain}」のような言い方にします。",
+                            s))
+
+    # 人間らしさスロップ
+    caps = prof.get("humanize_slop")
+    if caps is not None:
+        hits: Dict[str, List[Tuple[int, str]]] = {pid: [] for pid, _, _ in HUMANIZE_SLOP_PATTERNS}
+        for line_no, line in _content_lines(text):
+            s = line.strip()
+            if not s or _is_example_line(s):
+                continue
+            st = _scan_text(s)
+            for pid, pat, _ in HUMANIZE_SLOP_PATTERNS:
+                for _ in re.finditer(pat, st):
+                    hits[pid].append((line_no, s))
+        for pid, _, desc in HUMANIZE_SLOP_PATTERNS:
+            cap = caps.get(pid, 0)
+            found = hits[pid]
+            if len(found) <= cap:
+                continue
+            line_no, s = found[cap]
+            if pid == "fabricated":
+                findings.append(_finding(
+                    "humanize_slop", line_no, "info",
+                    f"{desc}があります。元の文にない体験や感想は足さず、書き手の言葉が要るなら「[ここに一言]」のような空欄にします。",
+                    s))
+            else:
+                findings.append(_finding(
+                    "humanize_slop", line_no, "warn",
+                    f"{desc}が{len(found)}回あります（この用途の上限: {cap}回）。人が書いたように見せる演出として目立ちやすいので減らします。",
+                    s))
+
+    # 書き手に埋めてもらう空欄
+    placeholders = [(no, m.group(0)) for no, line in _content_lines(text) for m in PLACEHOLDER_PATTERN.finditer(line)]
+    pmax = prof.get("placeholder_max")
+    if pmax is not None and len(placeholders) > pmax:
+        findings.append(_finding(
+            "too_many_placeholders", placeholders[0][0], "warn",
+            f"書き手に埋めてもらう空欄が{len(placeholders)}か所あります（この用途の上限: {pmax}か所）。書き手の言葉が本当に要る場所だけに絞ります。",
+            " ".join(p for _, p in placeholders)))
+
+    return findings, placeholders
+
+
+def lint_text(text: str, profile: Union[str, Dict[str, Any]] = "default",
+              profiles: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """文章全体を総合検査する。profile に用途プロファイル名（または設定の辞書）を渡すと、その用途の基準で検査する"""
+    if isinstance(profile, dict):
+        profile_name, prof = profile.get("name", "custom"), dict(BASE_PROFILE, **profile)
+    else:
+        profiles = profiles or load_profiles()
+        if profile not in profiles:
+            raise ValueError(f"プロファイル「{profile}」はありません。使えるもの: {', '.join(profiles)}")
+        profile_name, prof = profile, profiles[profile]
+    is_default = profile_name == "default"
+
     findings = []
-    metrics = analyze_markdown_metrics(text)
-    sentences = extract_plain_sentences(text)
+    metrics = analyze_markdown_metrics(text, dot_bullets=not is_default)
+    sentences = extract_plain_sentences(text, dot_bullets=not is_default)
 
     # 1. メトリクス異常の検査（地の文が十分ある場合に適用）
     if metrics["char_count"] > 300:
-        if metrics["bold_per_1000"] > 3.0:
+        bold_warn = prof.get("bold_per_1000_warn")
+        if bold_warn is not None and metrics["bold_per_1000"] > bold_warn:
             findings.append({
                 "rule": "excess_bold",
                 "line": 1,
                 "severity": "warn",
-                "message": f"太字の頻度（1,000字あたり {metrics['bold_per_1000']}個）が高すぎます（推奨: 2.5以下）。重要な要点のみに絞ってください。",
+                "message": (f"太字の頻度（1,000字あたり {metrics['bold_per_1000']}個）が高すぎます（推奨: 2.5以下）。重要な要点のみに絞ってください。"
+                            if is_default else
+                            f"太字の頻度（1,000字あたり {metrics['bold_per_1000']}個）が、この用途の警告ライン（{bold_warn}）を超えています。重要な要点のみに絞ってください。"),
                 "snippet": f"太字数: {metrics['bold_count']}回 / {metrics['char_count']}文字"
             })
 
-        if metrics["list_ratio"] > 0.25:
+        list_warn = prof.get("list_ratio_warn")
+        if list_warn is not None and metrics["list_ratio"] > list_warn:
             findings.append({
                 "rule": "excess_list",
                 "line": 1,
                 "severity": "warn",
-                "message": f"箇条書きの比率（{round(metrics['list_ratio']*100, 1)}%）が高すぎます（推奨: 20%以下）。思考や論理展開は地の文で記述してください。",
+                "message": (f"箇条書きの比率（{round(metrics['list_ratio']*100, 1)}%）が高すぎます（推奨: 20%以下）。思考や論理展開は地の文で記述してください。"
+                            if is_default else
+                            f"箇条書きの比率（{round(metrics['list_ratio']*100, 1)}%）が、この用途の警告ライン（{round(list_warn*100)}%）を超えています。思考や論理展開は地の文で記述してください。"),
                 "snippet": f"リスト行: {metrics['list_lines']} / 全非空行: {metrics['total_lines']}"
             })
 
     # 2. 文末重複検査
-    findings.extend(check_sentence_end_repetitions(sentences))
+    if prof.get("sentence_end_repetition", True):
+        findings.extend(check_sentence_end_repetitions(sentences))
 
     # 2.5 太字が表示されるか（GitHub などの Markdown で ** がそのまま出るところ）
     for p in bold_problems(text):
@@ -394,6 +863,11 @@ def lint_text(text: str) -> Dict[str, Any]:
     lines = text.split("\n")
     in_code = False
     fm_lines = get_frontmatter_line_count(lines)
+    emoji_max = prof.get("emoji_max", 0) or 0
+    emoji_allowed = prof.get("emoji_allowed")
+    if emoji_allowed is not None:
+        emoji_allowed = {e.replace("️", "") for e in emoji_allowed}
+    emoji_seen = 0
     for line_no, line in enumerate(lines, 1):
         if line_no <= fm_lines:
             continue
@@ -404,9 +878,9 @@ def lint_text(text: str) -> Dict[str, Any]:
         if in_code:
             continue
 
-        # 絵文字検知（見出し・本文問わず禁止）
+        # 絵文字検知（プロファイルなしでは見出し・本文問わず禁止。用途プロファイルでは上限まで使える）
         emoji_matches = EMOJI_PATTERN.findall(line)
-        if emoji_matches:
+        if emoji_matches and emoji_max == 0 and emoji_allowed is None:
             findings.append({
                 "rule": "emoji_prohibited",
                 "line": line_no,
@@ -414,6 +888,28 @@ def lint_text(text: str) -> Dict[str, Any]:
                 "message": f"絵文字（{' '.join(emoji_matches[:3])}）が検出されました。AI特有の装飾を排し、平文で記述してください。",
                 "snippet": line.strip()
             })
+        elif emoji_matches:
+            before = emoji_seen
+            emoji_seen += len(emoji_matches)
+            if emoji_seen > emoji_max:
+                over = emoji_matches[max(0, emoji_max - before):]
+                findings.append({
+                    "rule": "emoji_prohibited",
+                    "line": line_no,
+                    "severity": "warn",
+                    "message": f"絵文字（{' '.join(over[:3])}）が、この用途の上限（1文書に{emoji_max}個）を超えています。",
+                    "snippet": line.strip()
+                })
+            if emoji_allowed is not None:
+                odd = [e for e in emoji_matches if e not in emoji_allowed]
+                if odd:
+                    findings.append({
+                        "rule": "emoji_not_allowed",
+                        "line": line_no,
+                        "severity": "info",
+                        "message": f"絵文字（{' '.join(odd[:3])}）は、この用途で使う絵文字（{' '.join(sorted(emoji_allowed))}）に入っていません。意味を補う絵文字だけを使います。",
+                        "snippet": line.strip()
+                    })
 
         # 見出し行の余計な言い換え補足カッコ検知
         if stripped.startswith("#"):
@@ -449,11 +945,12 @@ def lint_text(text: str) -> Dict[str, Any]:
                 })
 
         # 文末コロン（全角「：」または半角「:」）検知
-        if re.search(r"[：:]$", scan_text) and not scan_text.startswith("http"):
+        colon_sev = prof.get("trailing_colon", "warn")
+        if colon_sev != "off" and re.search(r"[：:]$", scan_text) and not scan_text.startswith("http"):
             findings.append({
                 "rule": "trailing_colon",
                 "line": line_no,
-                "severity": "warn",
+                "severity": colon_sev,
                 "message": "文末にコロン（：）が使われています。英語直訳の記法を避け、平文の句点（。）で終えるか前置きを省いてください。",
                 "snippet": line.strip()
             })
@@ -522,16 +1019,29 @@ def lint_text(text: str) -> Dict[str, Any]:
                     "snippet": line.strip()
                 })
 
+    # 4. 用途プロファイルの検査（文の長さ、硬さ、人間らしさスロップ、記号の扱いなど）
+    register = None
+    placeholders: List[Tuple[int, str]] = []
+    if not is_default:
+        register = register_metrics(text, sentences)
+        extra, placeholders = check_profile(text, sentences, prof, register)
+        findings.extend(extra)
+
     # スコア計算（100点満点からの減点方式: warn=5点, info=2点）
     penalty = sum(5 if f["severity"] in ("warn", "error") else 2 for f in findings)
     score = max(0, 100 - penalty)
 
-    return {
+    result = {
         "score": score,
         "is_clean": len(findings) == 0,
+        "profile": profile_name,
         "metrics": metrics,
         "findings": findings
     }
+    if register is not None:
+        result["register_metrics"] = register
+        result["placeholders"] = [{"line": no, "text": p} for no, p in placeholders]
+    return result
 
 
 def main():
@@ -539,8 +1049,27 @@ def main():
     parser.add_argument("file", nargs="?", help="検査対象のMarkdownファイルパス（指定なしの場合は標準入力）")
     parser.add_argument("--json", action="store_true", help="JSON形式で出力")
     parser.add_argument("--strict", action="store_true", help="警告が1件でもあれば非ゼロ（終了コード1）で終了")
+    parser.add_argument("--profile", default="default",
+                        help="用途プロファイル（proposal / article / sns / chat / chat_external など。指定なしは従来どおりの検査）")
+    parser.add_argument("--profiles-file", help="自分で定義したプロファイルのJSON（同梱の profiles.json に追加・上書きする）")
+    parser.add_argument("--list-profiles", action="store_true", help="使えるプロファイルの一覧を表示して終了")
 
     args = parser.parse_args()
+
+    try:
+        profiles = load_profiles(args.profiles_file)
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        print(f"Error loading profiles: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if args.list_profiles:
+        for name, conf in profiles.items():
+            print(f"{name}: {conf.get('description', '')}")
+        sys.exit(0)
+
+    if args.profile not in profiles:
+        print(f"Error: プロファイル「{args.profile}」はありません。使えるもの: {', '.join(profiles)}", file=sys.stderr)
+        sys.exit(2)
 
     if args.file:
         try:
@@ -552,11 +1081,11 @@ def main():
     else:
         content = sys.stdin.read()
 
-    result = lint_text(content)
+    result = lint_text(content, args.profile, profiles)
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
-    else:
+    elif args.profile == "default":
         print("=" * 60)
         print(f"AIっぽさ 検査レポート (スコア: {result['score']}/100)")
         print("=" * 60)
@@ -565,7 +1094,36 @@ def main():
         print(f"・太字頻度: 1,000字あたり {m['bold_per_1000']} 個 (推奨: 2.0以下 / 警告: 3.0超)")
         print(f"・箇条書き比率: {round(m['list_ratio']*100, 1)}% (推奨: 15%以下 / 警告: 25%超)")
         print("-" * 60)
+    else:
+        prof = profiles[args.profile]
+        print("=" * 60)
+        print(f"AIっぽさ 検査レポート [{args.profile}: {prof.get('description', '')}] (スコア: {result['score']}/100)")
+        print("=" * 60)
+        m, r = result["metrics"], result["register_metrics"]
+        print(f"・文字数: {m['char_count']} | 行数: {m['total_lines']}")
+        sl = prof.get("sentence_length") or {}
+        rng = sl.get("mean")
+        if r["sentence_count"]:
+            print(f"・文の長さ: 平均 {r['sentence_len_mean']}字 / ばらつき {r['sentence_len_sd']} / 最大 {r['sentence_len_max']}字"
+                  + (f" (目安: 平均{rng[0]}〜{rng[1]}字)" if rng else ""))
+        if r["list_item_count"]:
+            print(f"・箇条書き: {r['list_item_count']}項目 / 平均 {r['list_item_len_mean']}字 / 最大 {r['list_item_len_max']}字"
+                  + (f" (目安: 1項目{prof['list_item_max']}字以内)" if prof.get("list_item_max") else ""))
+        if prof.get("title_max") and r["heading_len_max"]:
+            print(f"・タイトル: 最大 {r['heading_len_max']}字 (目安: {prof['title_max']}字以内)")
+        if prof.get("x_weighted_max"):
+            print("・Xの文字数: " + " / ".join(f"全角換算 約{math.ceil(w / 2)}字" for w in r["x_weighted_lengths"])
+                  + f" (上限: {prof['x_weighted_max'] // 2}字。URLは1本で約12字)")
+        print(f"・漢字の割合: {round(r['kanji_ratio']*100, 1)}%")
+        bw, lw = prof.get("bold_per_1000_warn"), prof.get("list_ratio_warn")
+        print(f"・太字頻度: 1,000字あたり {m['bold_per_1000']} 個" + (f" (警告: {bw}超)" if bw is not None else " (この用途では検査しない)"))
+        print(f"・箇条書き比率: {round(m['list_ratio']*100, 1)}%" + (f" (警告: {round(lw*100)}%超)" if lw is not None else " (この用途では検査しない)"))
+        if result["placeholders"]:
+            print(f"・書き手に埋めてもらう空欄: {len(result['placeholders'])}か所 ("
+                  + ", ".join(f"L{p['line']} {p['text']}" for p in result["placeholders"]) + ")")
+        print("-" * 60)
 
+    if not args.json:
         if result["is_clean"]:
             print("[PASS] 設定された検査ルールによる指摘はありません。")
         else:
